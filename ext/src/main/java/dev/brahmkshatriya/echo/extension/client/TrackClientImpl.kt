@@ -1,0 +1,201 @@
+package dev.brahmkshatriya.echo.extension.client
+
+import dev.brahmkshatriya.echo.common.clients.TrackClient
+import dev.brahmkshatriya.echo.common.models.Track
+import dev.brahmkshatriya.echo.common.models.Feed
+import dev.brahmkshatriya.echo.common.models.Feed.Buttons
+import dev.brahmkshatriya.echo.common.models.Shelf
+import dev.brahmkshatriya.echo.common.models.Streamable
+import dev.brahmkshatriya.echo.common.models.Feed.Companion.toFeed
+import dev.brahmkshatriya.echo.common.models.NetworkRequest.Companion.toGetRequest
+
+import kotlinx.coroutines.async
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import java.util.concurrent.ConcurrentHashMap
+
+import dev.brahmkshatriya.echo.extension.JioSaavnApi
+import dev.brahmkshatriya.echo.extension.JioSaavnParser
+import dev.brahmkshatriya.echo.extension.service.RadioService
+import dev.brahmkshatriya.echo.extension.service.AlbumService
+import dev.brahmkshatriya.echo.extension.utils.decryptUrl
+import dev.brahmkshatriya.echo.extension.utils.getToken
+import dev.brahmkshatriya.echo.extension.utils.Extras
+
+class TrackClientImpl(
+    private val api: JioSaavnApi,
+    private val parser: JioSaavnParser,
+    private val radioService: RadioService,
+    private val albumService: AlbumService,
+    private val scope: CoroutineScope
+) : TrackClient {
+
+    // Single-entry cache for the last loaded track, plus in-flight dedup so that
+    // concurrent loadTrack calls for the same track share one network fetch.
+    private var cachedTrackId: String? = null
+    private var cachedTrack: Track? = null
+    private val inflightTrackLoads = ConcurrentHashMap<String, Deferred<Track>>()
+
+    override suspend fun loadTrack(track: Track, isDownload: Boolean): Track {
+        // Cache hit
+        if (cachedTrackId == track.id && cachedTrack != null) {
+            return cachedTrack!!
+        }
+
+        // In-flight check + start
+        val deferred = inflightTrackLoads.computeIfAbsent(track.id) {
+            scope.async {
+                val token = track.getToken()
+                val response = api.track.getDetails(token)
+                val parsed = parser.track.parseSongDetails(response).firstOrNull() ?: track
+
+                cachedTrackId = track.id
+                cachedTrack = parsed
+
+                parsed
+            }
+        }
+
+        return try {
+            deferred.await()
+        } finally {
+            inflightTrackLoads.remove(track.id)
+        }
+    }
+
+    override suspend fun loadStreamableMedia(
+        streamable: Streamable,
+        isDownload: Boolean
+    ): Streamable.Media {
+        return when (streamable.type) {
+            Streamable.MediaType.Server -> {
+                val encryptedUrl = streamable.extras["encryptedMediaUrl"]
+                    ?: throw Exception("No encrypted URL found")
+                
+                // Decrypt on demand
+                val urls = decryptUrl(encryptedUrl)
+                    ?: throw Exception("Failed to decrypt URL")
+                
+                val sources = mutableListOf<Streamable.Source.Http>()
+                
+                urls["veryHigh"]?.let {
+                    sources.add(Streamable.Source.Http(
+                        request = it.toGetRequest(),
+                        type = Streamable.SourceType.Progressive,
+                        quality = 320,
+                        title = "320kbps"
+                    ))
+                }
+                
+                urls["high"]?.let {
+                    sources.add(Streamable.Source.Http(
+                        request = it.toGetRequest(),
+                        type = Streamable.SourceType.Progressive,
+                        quality = 160,
+                        title = "160kbps"
+                    ))
+                }
+                
+                urls["medium"]?.let {
+                    sources.add(Streamable.Source.Http(
+                        request = it.toGetRequest(),
+                        type = Streamable.SourceType.Progressive,
+                        quality = 96,
+                        title = "96kbps"
+                    ))
+                }
+                
+                urls["low"]?.let {
+                    sources.add(Streamable.Source.Http(
+                        request = it.toGetRequest(),
+                        type = Streamable.SourceType.Progressive,
+                        quality = 48,
+                        title = "48kbps"
+                    ))
+                }
+                
+                if (sources.isEmpty()) {
+                    throw Exception("No valid stream URLs available")
+                }
+                
+                Streamable.Media.Server(sources, false)
+            }
+            Streamable.MediaType.Background -> {
+                throw Exception("Background streamables not supported")
+            }
+            Streamable.MediaType.Subtitle -> {
+                throw Exception("Subtitles not supported")
+            }
+        }
+    }
+
+    override suspend fun loadFeed(track: Track): Feed<Shelf> {
+        return try {
+            val shelves = mutableListOf<Shelf>()
+
+            // ===== OTHER ARTISTS SHELF =====
+            val otherArtists = parser.artist.parseOtherArtistsFromExtras(
+                track.extras[Extras.ARTIST_MAP]
+            )
+            if (otherArtists.isNotEmpty()) {
+                shelves.add(
+                    Shelf.Lists.Items(
+                        id = "other_artists",
+                        title = "Other Artists",
+                        list = otherArtists,
+                        subtitle = "${otherArtists.size} artists"
+                    )
+                )
+            }
+
+            // ===== SIMILAR TRACKS SHELF =====
+            val songId = track.id
+
+            // val recoResponse = api.track.getSongReco(songId)
+            // val songs = parser.track.parseSongReco(recoResponse)
+
+            val songs = radioService.getRadioTracks(songId, limit = 20)
+
+            if (songs.isNotEmpty()) {
+                shelves.add(
+                    // TODO: Change to Lists.Tracks when No item found issue is fixed in Echo
+                    Shelf.Lists.Items(
+                        id = "similar_tracks",
+                        title = "Similar Tracks",
+                        list = songs,
+                        subtitle = "You might also like"
+                    )
+                )
+            }
+
+            // ===== MORE FROM ALBUM SHELF =====
+            val album = track.album
+            if (album != null) {
+                // Ensure album is loaded
+                try {
+                    albumService.loadAlbum(album)
+                } catch (e: Exception) {
+                    // logged inside service
+                }
+
+                val albumTracks = albumService.getCachedTracks(album.id) ?: emptyList()
+                val otherTracks = albumTracks.filter { it.id != track.id }
+
+                if (otherTracks.isNotEmpty()) {
+                    shelves.add(
+                        Shelf.Lists.Items(
+                            id = "more_from_album",
+                            title = "More from ${album.title}",
+                            list = otherTracks,
+                            subtitle = "${otherTracks.size} tracks"
+                        )
+                    )
+                }
+            }
+
+            shelves.toFeed(buttons = Buttons.EMPTY)
+        } catch (e: Exception) {
+            emptyList<Shelf>().toFeed()
+        }
+    }
+}
